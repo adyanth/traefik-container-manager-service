@@ -1,4 +1,4 @@
-module git.adyanth.site/adyanth/traefik-compose-manager-service
+module github.com/adyanth/traefik-container-manager-service
 
 go 1.16
 
