@@ -1,20 +1,13 @@
 package main
 
 import (
-	// "context"
-	// "fmt"
-	// "log"
-	// "net/http"
-	// "net/url"
-	// "strconv"
-	// "time"
-
 	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -40,6 +33,8 @@ const (
 type Service struct {
 	name      string
 	timeout   uint64
+	host      string
+	path      string
 	time      chan uint64
 	isHandled bool
 }
@@ -48,7 +43,7 @@ var services = map[string]*Service{}
 
 func main() {
 	fmt.Println("Server listening on port 10000.")
-	http.HandleFunc("/", handleRequests())
+	http.HandleFunc("/api/", handleRequests())
 	log.Fatal(http.ListenAndServe(":10000", nil))
 }
 
@@ -58,13 +53,18 @@ func handleRequests() func(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(fmt.Errorf("%+v", "Could not connect to docker API"))
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		serviceName, serviceTimeout, err := parseParams(r)
+		serviceName, serviceTimeout, serviceHost, servicePath, err := parseParams(r)
 		fmt.Println(serviceName, serviceTimeout)
 		if err != nil || serviceName == "" || serviceTimeout == 0 {
 			fmt.Fprintf(w, "error: %+v, service name = `%s`, timeout = `%d`", err, serviceName, serviceTimeout)
 			return
 		}
-		service := GetOrCreateService(serviceName, serviceTimeout)
+		service, err := GetOrCreateService(serviceName, serviceTimeout, serviceHost, servicePath, cli)
+		if err != nil {
+			fmt.Printf("Error: %+v\n ", err)
+			fmt.Fprintf(w, "%+v", err)
+			return
+		}
 		status, err := service.HandleServiceState(cli)
 		if err != nil {
 			fmt.Printf("Error: %+v\n ", err)
@@ -81,33 +81,68 @@ func getParam(queryParams url.Values, paramName string) (string, error) {
 	return queryParams[paramName][0], nil
 }
 
-func parseParams(r *http.Request) (string, uint64, error) {
+func parseParams(r *http.Request) (string, uint64, string, string, error) {
 	queryParams := r.URL.Query()
 
 	serviceName, err := getParam(queryParams, "name")
 	if err != nil {
-		return "", 0, nil
+		return "", 0, "", "", nil
+	}
+
+	host, _ := getParam(queryParams, "host")
+	serviceHost, err := url.QueryUnescape(host)
+	if err != nil {
+		return "", 0, "", "", nil
+	}
+
+	path, _ := getParam(queryParams, "path")
+	servicePath, err := url.QueryUnescape(path)
+	if err != nil {
+		return "", 0, "", "", nil
 	}
 
 	timeoutString, err := getParam(queryParams, "timeout")
 	if err != nil {
-		return "", 0, nil
+		return "", 0, "", "", nil
 	}
 	serviceTimeout, err := strconv.Atoi(timeoutString)
 	if err != nil {
-		return "", 0, fmt.Errorf("timeout should be an integer")
+		return "", 0, "", "", fmt.Errorf("timeout should be an integer")
 	}
-	return serviceName, uint64(serviceTimeout), nil
+	return serviceName, uint64(serviceTimeout), serviceHost, servicePath, nil
 }
 
-func GetOrCreateService(name string, timeout uint64) *Service {
-	if services[name] != nil {
-		return services[name]
+func GetOrCreateService(name string, timeout uint64, host, path string, client *client.Client) (*Service, error) {
+	if name == "generic-container-manager" {
+		checkerService := Service{
+			name:      name,
+			timeout:   timeout,
+			host:      host,
+			path:      path,
+			time:      make(chan uint64, 1),
+			isHandled: false,
+		}
+		ctx := context.Background()
+		containers, err := checkerService.getDockerContainers(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		name = containers[0].Labels["traefik-container-manager.name"]
 	}
-	service := &Service{name, timeout, make(chan uint64, 1), false}
+	if services[name] != nil {
+		return services[name], nil
+	}
+	service := &Service{
+		name:      name,
+		timeout:   timeout,
+		host:      host,
+		path:      path,
+		time:      make(chan uint64, 1),
+		isHandled: false,
+	}
 
 	services[name] = service
-	return service
+	return service, nil
 }
 
 // HandleServiceState up the service if down or set timeout for downing the service
@@ -242,11 +277,38 @@ func (service *Service) stopContainers(client *client.Client) error {
 func (service *Service) getDockerContainers(ctx context.Context, client *client.Client) ([]types.Container, error) {
 	opts := types.ContainerListOptions{All: true}
 	opts.Filters = filters.NewArgs()
-	opts.Filters.Add("label", fmt.Sprintf("%s=%s", "traefik-manager-name", service.name))
-	services, err := client.ContainerList(context.Background(), opts)
+	opts.Filters.Add("label", "traefik-container-manager.name")
+	containers, err := client.ContainerList(context.Background(), opts)
+	fmt.Println("Containers", containers)
+	requiredContainers := make([]types.Container, 0)
+	for _, container := range containers {
+		labelName := container.Labels["traefik-container-manager.name"]
+		if strings.EqualFold(service.name, labelName) {
+			fmt.Printf("Using name: %s\n", service.name)
+			requiredContainers = append(requiredContainers, container)
+			continue
+		}
+		if labelHost, ok := container.Labels["traefik-container-manager.host"]; ok {
+			if strings.HasPrefix(service.host, labelHost) || strings.HasPrefix(labelHost, service.host) {
+				fmt.Printf("Using host: %s\n", service.host)
+				requiredContainers = append(requiredContainers, container)
+			}
+			continue
+		}
 
+		if labelPath, ok := container.Labels["traefik-container-manager.path"]; ok {
+			if strings.HasPrefix(service.path, labelPath) || strings.HasPrefix(labelPath, service.path) {
+				fmt.Printf("Using path: %s\n", service.path)
+				requiredContainers = append(requiredContainers, container)
+			}
+			continue
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	return services, nil
+	if len(requiredContainers) == 0 {
+		return requiredContainers, fmt.Errorf("no containers found")
+	}
+	return requiredContainers, nil
 }
